@@ -1,0 +1,8 @@
+seed: 42
+model: {checkpoint: bert-base-multilingual-cased}
+data: {path: data/corpus.parquet, id_column: doc_id, text_columns: [text]}
+chunking: {max_length: 126, stride: 0}
+objective: mlm
+entities: {provider: none}
+masking: {strategy: random, probability: 0.15, replacement: 100_percent_mask}
+training: {output_dir: outputs/mlm-100mask, per_device_train_batch_size: 8, max_steps: 1000}
