@@ -7,7 +7,8 @@ class MLMCollator:
     def __init__(self, tokenizer, schedule, policy=None, entity_provider=None, replacement="bert_80_10_10", seed=0, include_metadata=False):
         self.tokenizer, self.schedule = tokenizer, schedule
         self.policy, self.entity_provider, self.replacement = policy or RandomMasking(), entity_provider, replacement
-        self.rng=random.Random(seed); self.progress=0.0; self.include_metadata=include_metadata; self.last_diagnostics={}
+        self.seed=seed; self.rng=random.Random(seed); self.progress=0.0; self.include_metadata=include_metadata; self.last_diagnostics={}
+    def reset_seed(self): self.rng.seed(self.seed)
     def set_progress(self, processed_tokens, token_budget): self.progress=min(1,processed_tokens/token_budget) if token_budget else 0
     def __call__(self, examples):
         import torch

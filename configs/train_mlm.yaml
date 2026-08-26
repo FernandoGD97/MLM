@@ -1,0 +1,36 @@
+objective: mlm
+model: {checkpoint: bert-base-multilingual-cased}
+data:
+  train: {path: data/train.parquet, id_column: doc_id, text_columns: [text]}
+  validation: {path: data/validation.parquet, id_column: doc_id, text_columns: [text]}
+chunking: {max_length: 126, stride: 0}
+entities: {provider: none}
+masking:
+  strategy: random
+  schedule: {type: fixed, probability: 0.15}
+  replacement: bert_80_10_10
+training:
+  run_dir: runs/mlm
+  epochs: 5
+  learning_rate: 2.0e-5
+  batch_size: 8
+  gradient_accumulation_steps: 1
+  warmup_ratio: 0.05
+  scheduler: cosine
+  mixed_precision: "no"
+  seed: 42
+evaluation:
+  run_before_training: true
+  every_n_epochs: 1
+  language_model:
+    enabled: true
+    batch_size: 8
+    pppl: {enabled: true, backend: minicons_strided, pll_method: within_word_l2r, max_documents: 500, model_batch_size: 32, window_size: 128, stride: 64}
+  entity_linking:
+    enabled: false
+    every_n_epochs: 1
+    pooling: mean
+    normalize_embeddings: true
+    top_k: [1, 5, 25, 50, 100, 200]
+    terminologies: {}
+    datasets: []
