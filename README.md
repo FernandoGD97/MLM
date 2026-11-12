@@ -1,3 +1,15 @@
+# Biomedical CLM → Importance-aware MLM
+
+The new implementation uses the `lab` namespace and existing `lab run` CLI architecture
+inside this MLM repository, as requested. See [docs/cpt/README.md](docs/cpt/README.md)
+for installation, public APIs and executable synthetic CLM→MLM examples; see
+[docs/cpt/STATUS.md](docs/cpt/STATUS.md) for actual verification results and limitations.
+
+Para explorar uno o varios Parquet y comparar masking, consulta
+[el flujo de inspección](docs/cpt/inspection.md): `python scripts/inspect_corpus.py --help`.
+
+The original `encoder_pretraining` APIs and documentation follow below.
+
 # Modular continual pretraining for encoders
 
 Research-oriented data preparation and objective plumbing for **dynamic MLM**, temporary

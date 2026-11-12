@@ -1,0 +1,477 @@
+"""Verify span reconstruction and scoring, and diff both against NER-API's metrics."""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from _harness import Checks, run
+from fixtures import samples_root, synthetic_corpus
+
+from lab.core import safe_f1, score_characters, spans_from_corpus
+from lab.ner.evaluation import (
+    bio_to_spans,
+    entity_tags,
+    evaluate_predictions,
+    expand_to_word_extent,
+    gold_spans,
+    predicted_spans,
+    span_metrics,
+    strip_bio_prefix,
+    token_confusion_matrix,
+    token_metrics,
+    token_metrics_by_entity,
+)
+
+NER_API_ENV = "NER_API_ROOT"
+DEFAULT_NER_API = Path.home() / "bsc" / "NER-API"
+
+ID2LABEL = {0: "O", 1: "B-DISEASE", 2: "I-DISEASE"}
+
+
+def one_hot(label_ids: list[list[int]], num_labels: int = 3) -> np.ndarray:
+    width = max(len(row) for row in label_ids)
+    logits = np.full((len(label_ids), width, num_labels), -10.0, dtype=np.float32)
+
+    for row, ids in enumerate(label_ids):
+        for position, label_id in enumerate(ids):
+            logits[row, position, max(label_id, 0)] = 10.0
+
+    return logits
+
+
+def verify_helpers(checks: Checks) -> None:
+    checks.equal("B- prefix stripped", strip_bio_prefix("B-DISEASE"), "DISEASE")
+    checks.equal("O is left alone", strip_bio_prefix("O"), "O")
+    checks.equal("tags come from the vocabulary", entity_tags(ID2LABEL), ["DISEASE"])
+
+    score = safe_f1(tp=2, fp=1, fn=1)
+    checks.equal("precision", score["precision"], 0.6667)
+    checks.equal("recall", score["recall"], 0.6667)
+    checks.equal("f1", score["f1"], 0.6667)
+    checks.equal("empty counts give zero", safe_f1(0, 0, 0)["f1"], 0.0)
+
+    spans = bio_to_spans("d", [(0, 5), (6, 11), (12, 14)], ["B-DISEASE", "I-DISEASE", "O"])
+    checks.equal("B then I is one span", len(spans), 1)
+    checks.equal("the span covers both tokens", (spans[0]["start_span"], spans[0]["end_span"]), (0, 11))
+
+    two = bio_to_spans("d", [(0, 5), (6, 11)], ["B-DISEASE", "B-DISEASE"])
+    checks.equal("B then B is two spans", len(two), 2)
+
+    orphan = bio_to_spans("d", [(0, 5)], ["I-DISEASE"])
+    checks.equal("a leading I- still opens a span", len(orphan), 1)
+
+    switch = bio_to_spans("d", [(0, 5), (6, 11)], ["B-DISEASE", "I-GENE"])
+    checks.equal("I- of another type starts a new span", len(switch), 2)
+
+    checks.equal("all O gives nothing", bio_to_spans("d", [(0, 5)], ["O"]), [])
+    checks.raises(
+        "mismatched lengths raise", ValueError, bio_to_spans, "d", [(0, 5)], ["O", "O"]
+    )
+
+    expanded = expand_to_word_extent([(0, 3), (3, 7), (8, 12)], [0, 0, 1])
+    checks.equal(
+        "a first subword grows to its word's end", expanded, [(0, 7), (3, 7), (8, 12)]
+    )
+
+
+def verify_reconstruction(checks: Checks, tokenizer, name: str) -> None:
+    from lab.ner.encoding import Encoder
+
+    corpus = synthetic_corpus(10)
+    encoder = Encoder(tokenizer, "DISEASE", "es", max_length=64)
+    rows = encoder.encode(corpus)
+
+    gold = gold_spans(rows, tokenizer, encoder.id2label)
+
+    checks.check(f"{name}: gold spans are recovered", len(gold) > 0)
+    checks.equal(
+        f"{name}: recovered spans match the corpus entity count",
+        len(gold),
+        int(corpus["n_entities"].sum()),
+    )
+
+    corpus_spans = spans_from_corpus(corpus)
+    recovered = set(zip(gold["filename"], gold["start_span"], gold["end_span"]))
+    annotated = set(
+        zip(corpus_spans["filename"], corpus_spans["start_span"], corpus_spans["end_span"])
+    )
+
+    checks.equal(f"{name}: recovered offsets equal the annotated ones", recovered, annotated)
+
+    perfect = one_hot([[max(int(label), 0) for label in row] for row in rows["labels"]])
+    predicted = predicted_spans(rows, perfect, tokenizer, encoder.id2label)
+
+    checks.frames_equal(f"{name}: perfect predictions reproduce the gold spans", predicted, gold)
+
+    metrics = span_metrics(gold, predicted, id2label=encoder.id2label)
+    checks.equal(f"{name}: perfect predictions score 1.0 strict", metrics["span_strict_f1"], 1.0)
+    checks.equal(f"{name}: nothing is missed", metrics["span_strict_missed"], 0)
+    checks.equal(f"{name}: nothing is spurious", metrics["span_strict_spurious"], 0)
+    checks.equal(f"{name}: perfect predictions score 1.0 on characters", metrics["char_f1"], 1.0)
+    checks.equal(f"{name}: no character is missed", metrics["char_missed"], 0)
+
+    empty = np.zeros((len(rows), max(len(row) for row in rows["labels"]), 3), dtype=np.float32)
+    empty[:, :, 0] = 10.0
+
+    none_predicted = predicted_spans(rows, empty, tokenizer, encoder.id2label)
+    checks.equal(f"{name}: predicting all O gives no spans", len(none_predicted), 0)
+
+    empty_metrics = span_metrics(gold, none_predicted, id2label=encoder.id2label)
+    checks.equal(f"{name}: scoring nothing gives zero F1", empty_metrics["span_strict_f1"], 0.0)
+    checks.equal(f"{name}: every gold span is missed", empty_metrics["span_strict_missed"], len(gold))
+    checks.equal(f"{name}: scoring nothing gives zero character F1", empty_metrics["char_f1"], 0.0)
+    checks.equal(
+        f"{name}: every gold character is missed",
+        empty_metrics["char_missed"],
+        int((gold["end_span"] - gold["start_span"]).sum()),
+    )
+
+    checks.raises(
+        f"{name}: a prediction/row length mismatch raises",
+        ValueError,
+        predicted_spans,
+        rows,
+        perfect[:-1],
+        tokenizer,
+        encoder.id2label,
+    )
+    checks.raises(
+        f"{name}: missing columns raise",
+        ValueError,
+        gold_spans,
+        rows.drop(columns=["word_ids"]),
+        tokenizer,
+        encoder.id2label,
+    )
+
+    all_metrics = evaluate_predictions(
+        rows, perfect, tokenizer, encoder.id2label, include_confusion=True
+    )
+
+    checks.equal(f"{name}: span and token metrics agree at perfection", all_metrics["token_micro_f1"], 1.0)
+    checks.equal(f"{name}: token accuracy is perfect too", all_metrics["token_accuracy"], 1.0)
+    checks.check(f"{name}: per-entity token metrics appear", "token_entity_DISEASE_f1" in all_metrics)
+    checks.check(f"{name}: the confusion matrix appears", "confusion_gold_O_pred_O" in all_metrics)
+    checks.check(f"{name}: per-tag token metrics appear", "token_tag_B-DISEASE_f1" in all_metrics)
+
+
+def verify_unknown_tokens(checks: Checks, tokenizer) -> None:
+    from lab.core import build_corpus
+    from lab.ner.encoding import Encoder
+
+    unknown = "☤"
+    text = f"Paciente {unknown} con neumonia {unknown} bilateral y fiebre alta."
+    mentions = [f"neumonia {unknown} bilateral", "fiebre alta"]
+    annotations = pd.DataFrame(
+        [
+            {
+                "filename": "doc_unk",
+                "mark": f"T{index + 1}",
+                "label": "DISEASE",
+                "start_span": text.index(mention),
+                "end_span": text.index(mention) + len(mention),
+                "text": mention,
+            }
+            for index, mention in enumerate(mentions)
+        ]
+    )
+    corpus = build_corpus({"doc_unk": text}, annotations)
+
+    encoder = Encoder(tokenizer, "DISEASE", "es", max_length=64)
+    rows = encoder.encode(corpus)
+    input_ids = [int(token_id) for row in rows["input_ids"] for token_id in row]
+
+    checks.check(
+        "the fixture really produces an unknown token",
+        input_ids.count(tokenizer.unk_token_id) == 2,
+    )
+
+    gold = gold_spans(rows, tokenizer, encoder.id2label)
+    recovered = set(zip(gold["start_span"], gold["end_span"]))
+    annotated = set(zip(annotations["start_span"], annotations["end_span"]))
+
+    checks.equal("unknown tokens: gold offsets equal the annotated ones", recovered, annotated)
+
+    perfect = one_hot([[max(int(label), 0) for label in row] for row in rows["labels"]])
+    predicted = predicted_spans(rows, perfect, tokenizer, encoder.id2label)
+
+    checks.frames_equal("unknown tokens: perfect predictions reproduce the gold", predicted, gold)
+
+    from transformers import AutoTokenizer
+
+    gpt2_encoder = Encoder(AutoTokenizer.from_pretrained("gpt2"), "DISEASE", "es", max_length=64)
+
+    checks.raises(
+        "rows scored with a tokenizer of another template raise",
+        ValueError,
+        gold_spans,
+        gpt2_encoder.encode(corpus),
+        tokenizer,
+        encoder.id2label,
+    )
+
+
+def verify_wordless_tokens(checks: Checks, tokenizer, workspace: Path) -> None:
+    from lab.core import build_corpus
+    from lab.ner.encoding import Encoder
+
+    text = "Paciente con neumonia  bilateral y fiebre."
+    mention = "neumonia  bilateral"
+    start = text.index(mention)
+    annotations = pd.DataFrame(
+        [
+            {
+                "filename": "doc_space",
+                "mark": "T1",
+                "label": "DISEASE",
+                "start_span": start,
+                "end_span": start + len(mention),
+                "text": mention,
+            }
+        ]
+    )
+    encoder = Encoder(tokenizer, "DISEASE", "es", max_length=64)
+    rows = encoder.encode(build_corpus({"doc_space": text}, annotations))
+
+    checks.check(
+        "the fixture really has a token in no word",
+        any(word_id is None for row in rows["word_ids"] for word_id in row),
+    )
+
+    gold = gold_spans(rows, tokenizer, encoder.id2label)
+
+    checks.equal(
+        "a whitespace token inside an entity does not split it",
+        list(zip(gold["start_span"], gold["end_span"])),
+        [(start, start + len(mention))],
+    )
+
+    path = workspace / "rows.parquet"
+    rows.to_parquet(path)
+    reread = pd.read_parquet(path)
+
+    checks.frames_equal(
+        "gold survives the parquet round trip that turns a missing word into NaN",
+        gold_spans(reread, tokenizer, encoder.id2label),
+        gold,
+    )
+    checks.equal(
+        "a token in no word keeps its own offset when words are expanded",
+        expand_to_word_extent([(0, 3), (3, 4), (4, 7)], [0, None, 0]),
+        [(0, 7), (3, 4), (4, 7)],
+    )
+
+
+def verify_token_metrics(checks: Checks) -> None:
+    labels = np.array([[0, 1, 2, -100]])
+    perfect = one_hot([[0, 1, 2, 0]])
+
+    metrics = token_metrics(perfect, labels, ID2LABEL)
+
+    checks.equal("perfect token f1", metrics["token_micro_f1"], 1.0)
+    checks.equal("the masked position is skipped", metrics["token_tag_B-DISEASE_tp"], 1)
+
+    wrong = one_hot([[0, 0, 0, 0]])
+    missed = token_metrics(wrong, labels, ID2LABEL)
+
+    checks.equal("all-O predictions score zero", missed["token_micro_f1"], 0.0)
+    checks.equal("both entity tokens are false negatives", missed["token_tag_B-DISEASE_fn"], 1)
+    checks.equal("accuracy still counts the O token", missed["token_accuracy"], 0.3333)
+
+    empty = token_metrics(one_hot([[0]]), np.array([[-100]]), ID2LABEL)
+    checks.equal("all-masked input gives zeros", empty["token_micro_f1"], 0.0)
+
+
+def verify_character_metrics(checks: Checks) -> None:
+    def span(filename, label, start, end):
+        return {"filename": filename, "label": label, "start_span": start, "end_span": end, "text": "x"}
+
+    gold = pd.DataFrame([span("d1", "DISEASE", 0, 10), span("d1", "DISEASE", 20, 30)])
+
+    identical = score_characters(gold, gold)
+    checks.equal("identical input scores 1.0", identical["char_f1"], 1.0)
+    checks.equal("every gold character is correct", identical["char_correct"], 20)
+    checks.equal("nothing is spurious", identical["char_spurious"], 0)
+
+    shifted = gold.assign(start_span=gold["start_span"] + 2)
+    partial = score_characters(gold, shifted)
+    checks.equal("a shifted span keeps its overlapping characters", partial["char_correct"], 16)
+    checks.equal("the uncovered gold characters are missed", partial["char_missed"], 4)
+    checks.equal("the overshoot is spurious", partial["char_spurious"], 0)
+    checks.equal("precision is exact", partial["char_precision"], 1.0)
+    checks.equal("recall is exact", partial["char_recall"], 0.8)
+
+    empty = pd.DataFrame(columns=list(gold.columns))
+    nothing = score_characters(gold, empty)
+    checks.equal("predicting nothing scores zero", nothing["char_f1"], 0.0)
+    checks.equal("every gold character is missed", nothing["char_missed"], 20)
+    checks.equal("scoring against no gold makes every character spurious", score_characters(empty, gold)["char_spurious"], 20)
+
+    relabelled = gold.assign(label="SYMPTOM")
+    checks.equal("a different label shares no character", score_characters(gold, relabelled)["char_correct"], 0)
+
+    overlapping_gold = pd.DataFrame([span("d1", "DISEASE", 0, 10), span("d1", "DISEASE", 5, 15)])
+    covering = pd.DataFrame([span("d1", "DISEASE", 0, 15)])
+    checks.equal(
+        "overlapping gold spans count each character once",
+        score_characters(overlapping_gold, covering),
+        {"char_precision": 1.0, "char_recall": 1.0, "char_f1": 1.0, "char_correct": 15, "char_missed": 0, "char_spurious": 0},
+    )
+
+    reordered = pd.DataFrame([span("d1", "DISEASE", 8, 15), span("d1", "DISEASE", 10, 20)])
+    single = pd.DataFrame([span("d1", "DISEASE", 10, 20)])
+    checks.equal(
+        "prediction order does not matter",
+        score_characters(single, reordered),
+        score_characters(single, reordered.iloc[::-1]),
+    )
+
+    elsewhere = pd.DataFrame([span("d2", "DISEASE", 0, 5)])
+    checks.equal(
+        "a prediction in a document with no gold is spurious",
+        score_characters(gold, pd.concat([gold, elsewhere]))["char_spurious"],
+        5,
+    )
+
+    corpus = synthetic_corpus(4)
+    spans = spans_from_corpus(corpus)
+
+    checks.equal("corpus conversion keeps every entity", len(spans), int(corpus["n_entities"].sum()))
+    checks.equal("labels are verbatim", set(spans["label"]), {"DISEASE"})
+    checks.check(
+        "span text is re-derived from the document",
+        all(
+            corpus.loc[corpus["doc_id"] == row.filename, "text"].iloc[0][
+                row.start_span:row.end_span
+            ]
+            == row.text
+            for row in spans.itertuples(index=False)
+        ),
+    )
+    checks.equal("a label filter keeps only that label", len(spans_from_corpus(corpus, label="OTHER")), 0)
+
+    verbatim = spans_from_corpus(synthetic_corpus(4, label="FARMACO"))
+    checks.equal("no normalization happens here either", set(verbatim["label"]), {"FARMACO"})
+
+
+def verify_against_ner_api(checks: Checks, tokenizer) -> None:
+    ner_api = Path(os.environ.get(NER_API_ENV, DEFAULT_NER_API))
+
+    if not (ner_api / "src").is_dir():
+        checks.skip("NER-API metrics equivalence", f"{ner_api} not found")
+        return
+
+    sys.path.insert(0, str(ner_api / "src"))
+
+    try:
+        from metrics import metrics as old
+    except Exception as error:
+        checks.skip("NER-API metrics equivalence", f"cannot import metrics: {error}")
+        return
+
+    from lab.ner.encoding import Encoder
+
+    samples = samples_root()
+    source = samples / "MultiClinNER-es-train-disease" if samples else None
+
+    if source is not None and (source / "txt").is_dir():
+        from lab.core import build_corpus
+
+        corpus = build_corpus(source / "txt", source / "ann", normalize_labels=True).head(40)
+    else:
+        corpus = synthetic_corpus(20)
+
+    encoder = Encoder(tokenizer, "DISEASE", "es", max_length=128)
+    rows = encoder.encode(corpus.reset_index(drop=True))
+
+    rng = np.random.default_rng(0)
+    predictions = rng.normal(size=(len(rows), max(len(row) for row in rows["input_ids"]), 3))
+    predictions = predictions.astype(np.float32)
+
+    old_gold = old.dataframe_gold_spans_from_token_labels(
+        df=rows, tokenizer=tokenizer, id2label=encoder.id2label
+    )
+    new_gold = gold_spans(rows, tokenizer, encoder.id2label)
+
+    checks.frames_equal("gold spans identical to NER-API", new_gold, old_gold)
+
+    old_predicted = old.dataframe_pred_spans_from_token_logits(
+        df=rows, predictions=predictions, tokenizer=tokenizer, id2label=encoder.id2label
+    )
+    new_predicted = predicted_spans(rows, predictions, tokenizer, encoder.id2label)
+
+    checks.frames_equal("predicted spans identical to NER-API", new_predicted, old_predicted)
+
+    old_span = old.compute_span_metrics_from_logits(
+        df=rows,
+        predictions=predictions,
+        tokenizer=tokenizer,
+        id2label=encoder.id2label,
+        max_length=128,
+    )
+    new_span = span_metrics(new_gold, new_predicted, id2label=encoder.id2label)
+
+    checks.equal(
+        "span metrics identical to NER-API",
+        {key: value for key, value in new_span.items() if key.startswith("span_")},
+        old_span,
+    )
+
+    labels = np.array(
+        [
+            [int(label) for label in row] + [-100] * (predictions.shape[1] - len(row))
+            for row in rows["labels"]
+        ]
+    )
+
+    checks.equal(
+        "token metrics identical to NER-API",
+        token_metrics(predictions, labels, encoder.id2label),
+        old.compute_token_classification_metrics(predictions, labels, encoder.id2label),
+    )
+    checks.equal(
+        "per-entity token metrics identical to NER-API",
+        token_metrics_by_entity(predictions, labels, encoder.id2label),
+        old.compute_token_classification_metrics_by_entity(
+            predictions, labels, encoder.id2label
+        ),
+    )
+    checks.equal(
+        "the confusion matrix is identical to NER-API",
+        token_confusion_matrix(predictions, labels, encoder.id2label),
+        old.compute_token_confusion_matrix(predictions, labels, encoder.id2label),
+    )
+
+
+def main() -> int:
+    from transformers import AutoTokenizer
+
+    checks = Checks("evaluation")
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    verify_helpers(checks)
+    verify_reconstruction(checks, tokenizer, "bert")
+    verify_reconstruction(checks, AutoTokenizer.from_pretrained("gpt2"), "gpt2")
+    verify_unknown_tokens(checks, tokenizer)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        verify_wordless_tokens(checks, AutoTokenizer.from_pretrained("gpt2"), Path(tmp))
+
+    verify_token_metrics(checks)
+    verify_character_metrics(checks)
+    verify_against_ner_api(checks, tokenizer)
+
+    return checks.report()
+
+
+if __name__ == "__main__":
+    run(main)

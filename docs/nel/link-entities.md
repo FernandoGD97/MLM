@@ -1,0 +1,158 @@
+# Link entities to an ontology
+
+```python
+from lab.nel import link_entities
+
+result = link_entities(
+    spans="assets/predictions/disease_crf/predictions.tsv",
+    gazetteer="assets/ontology/snomed_es.tsv",
+    output_dir="assets/linking/disease_crf",
+    method="matrix",
+)
+
+result.spans        # the input span table plus code | code_term | code_score | candidates_json
+result.metrics      # recall@k, MRR and coverage, when the input carried gold codes
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `spans` | *required* | A span table: frame, TSV or parquet with `filename, label, start_span, end_span, text`. A `code` column is taken as gold. |
+| `gazetteer` | *required* | A table with `term` and `code`, optionally `label` and `semantic_tag`. Frame, TSV or parquet. |
+| `output_dir` | *required* | Where the linked table, any scores and the manifest are written. |
+| `method` | `"matrix"` | How candidates are generated. See below. |
+| `base_model` | `None` | Encoder for `transformer_faiss` and `dense`, by hub name or local path. Invalid with the other methods. |
+| `method_kwargs` | `None` | Keyword arguments for the method's constructor, e.g. `{"threshold": 0.5}` or `{"f_type": "IVFFlatIP"}`. |
+| `reranker` | `None` | A cross-encoder model, by hub name or local path, applied to each mention's `top_k` candidates. |
+| `reranker_kwargs` | `None` | Keyword arguments for the reranker, e.g. `{"batch_size": 64, "device": "cuda"}`. |
+| `top_k` | `25` | Candidates kept per mention. The first one is the linked code. |
+| `k_values` | `(1, 5, 25)` | The `k` in `recall@k`. Each must lie between 1 and `top_k`. |
+| `hierarchy` | `None` | A pickled NetworkX graph of the ontology, parent to child. Adds exact / narrow / broad / unrelated proportions to the metrics. |
+| `keep_gold` | `False` | Complete instead of evaluate: spans with a gold code keep it and only the others are linked. See [completing a corpus](#completing-a-corpus). |
+| `index_dir` | `None` | Where `transformer_faiss` and `dense` keep the gazetteer's embeddings; `None` is `<output_dir>/gazetteer_index`. Invalid with the other methods. See [reusing the gazetteer's embeddings](#reusing-the-gazetteers-embeddings). |
+| `save_index` | `True` | `False` encodes the gazetteer in memory and writes nothing. An index already in `index_dir` is still loaded. |
+
+**Returns** a `LinkingResult` with `spans`, `metrics`, `manifest` and `paths`.
+
+## Methods
+
+| `method` | Kind | Needs |
+|---|---|---|
+| `string_match` | normalized exact match | — |
+| `levenshtein`, `jaro_winkler`, `token_set` | edit-distance and token-set similarity | `rapidfuzz` for speed; falls back to `difflib` |
+| `tfidf_char` | TF-IDF over character n-grams | scikit-learn |
+| `bm25` | BM25 over tokens | — |
+| `matrix` | sparse TF-IDF, character plus word n-grams, top-k by `argpartition` | scikit-learn |
+| `faiss` | hashed character n-grams in a FAISS flat index | faiss |
+| `transformer_faiss` | a transformer's pooled embeddings in a FAISS index | `base_model`, torch, faiss |
+| `dense` | a sentence-transformers bi-encoder and a torch matrix product | `base_model`, sentence-transformers |
+
+Every lexical method restricts candidates to gazetteer entries whose `label` equals the
+mention's when both are present (`label_aware`, on by default; pass it in `method_kwargs` to
+turn it off). Duplicate codes are collapsed to their best-scoring term. The pieces are public
+under `lab.nel.matching` and `lab.nel.retrieval`; `lab.nel.EntityLinkingPipeline` is what
+this task drives, and it takes several generators at once, fused by reciprocal rank fusion
+(`lab.nel.reciprocal_rank_fusion`).
+
+## The span table in and out
+
+The input keeps every column it came with. When it has a `code` column that column is gold:
+it is kept as `gold_code`, and rows with a non-empty value are scored. Four columns are
+appended, so the result is still a span table and a downstream tool that does not care about
+codes ignores them:
+
+| Column | Meaning |
+|---|---|
+| `code` | The linked concept: the top candidate's code, or empty when nothing was retrieved. |
+| `code_term` | The gazetteer term that candidate was matched through. |
+| `code_score` | The generator's or the reranker's score for it. |
+| `candidates_json` | The `top_k` candidates as a JSON list of `{code, term, score, method, rank, metadata}`. |
+
+Predictions from [`predict_entities`](../ner/predict-entities.md) link as they are: the `score` column
+they carry is NER's confidence and is preserved untouched beside `code_score`. A table that was
+linked before links again: `gold_code` stays gold and the four columns are written afresh.
+
+Gold from a corpus comes through [`prepare_dataset`'s `codes`](../core/prepare-dataset.md#gold-codes):
+`lab.core.spans_from_corpus` turns the corpus into a span table whose `code` column is the
+annotated gold, `NO_CODE` included.
+
+```python
+from lab.core import spans_from_corpus
+
+spans = spans_from_corpus("assets/splits/symptemist_train/documents.parquet")
+result = link_entities(spans, "symptemist_gazetter_snomed_ES_v2.tsv", "assets/linking/symptemist")
+```
+
+## Completing a corpus
+
+By default every span is linked and any gold code is only scored against. With
+`keep_gold=True` the gold is kept instead: a span with a gold code carries it as its `code`,
+only the uncoded spans are linked, and a fifth column says which is which:
+
+| Column | Meaning |
+|---|---|
+| `code_source` | `gold` for a code kept from the input, `predicted` for one this run linked. |
+
+`code_term`, `code_score` and `candidates_json` are empty on the gold rows. Nothing is scored,
+since no linked span has a gold code to compare with, and the manifest records `keep_gold`,
+`n_kept_gold` and `n_linked`. `gold_code` stays on the output, so a completed table fed back
+in evaluates against its original gold, never against its own predictions.
+
+## Reusing the gazetteer's embeddings
+
+Encoding a gazetteer of a few hundred thousand terms takes minutes on a GPU, and it is the
+same every run. The encoder methods therefore keep the embeddings in `index_dir`:
+
+| `index_dir` holds | What happens |
+|---|---|
+| nothing, or does not exist | The gazetteer is encoded and saved there, unless `save_index=False`. |
+| an index | It is loaded and checked against this run; only the mentions are encoded. |
+| files but no `index_manifest.json` | Refused: an interrupted build, or not an index. |
+
+An index records what its vectors depend on — the method, `base_model`, the gazetteer's
+`term`/`code` content, and the encoding settings (`pooling` and `max_length` for
+`transformer_faiss`, plus `batch_size` with `mean` pooling, which averages over padding;
+`normalize` for `dense`). One built for anything else is refused, naming what differs:
+delete it or pass another `index_dir`.
+
+The FAISS settings are not among them. The embeddings are stored as the encoder produced
+them and the FAISS index is rebuilt on load, so an index built with `f_type: FlatIP` serves
+`FlatL2`, `IVFFlatIP` or any other `f_type` without encoding the gazetteer again.
+
+To reuse one across runs, point `index_dir` at it:
+
+```python
+link_entities(spans, gazetteer, "assets/linking/test", method="transformer_faiss",
+              base_model="ICB-UMA/HERBERT-P", index_dir="assets/linking/train/gazetteer_index")
+```
+
+The manifest's `index` says `loaded`, `built`, or `in_memory`.
+
+## What it writes
+
+```
+<output_dir>/
+    predictions.tsv            the linked span table
+    linking_metrics.json       method, recall@k, MRR, coverage, mean candidates — when there was gold
+    linking_manifest.json      inputs and their sha256, method, model, top_k, keep_gold, index, what was linked
+    gazetteer_index/           encoder methods, unless index_dir points elsewhere or save_index is off
+        embeddings.npy         float32, one row per vocabulary row
+        vocabulary.parquet     term, code
+        index_manifest.json    what the embeddings depend on; written last
+```
+
+## From YAML
+
+```yaml
+task: nel.link_entities
+spans: assets/predictions/disease_crf/predictions.tsv
+gazetteer: assets/ontology/snomed_es.tsv
+output_dir: assets/linking/disease_crf
+method: transformer_faiss
+base_model: ICB-UMA/HERBERT-P
+method_kwargs:
+  f_type: FlatIP
+  batch_size: 128
+reranker: assets/models/cross_encoder
+top_k: 25
+k_values: [1, 5, 25]
+```
