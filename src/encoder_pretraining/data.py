@@ -58,7 +58,19 @@ def tokenize_and_chunk(documents: Iterable[Document], tokenizer, max_length: int
         for start in range(0, len(ids), step):
             chunk_ids, chunk_offsets = ids[start:start + max_length], offsets[start:start + max_length]
             if not chunk_ids: break
-            prepared = tokenizer.prepare_for_model(chunk_ids, add_special_tokens=True, return_special_tokens_mask=True)
+            if hasattr(tokenizer, "build_inputs_with_special_tokens"):
+                input_ids = tokenizer.build_inputs_with_special_tokens(chunk_ids)
+                prepared = {"input_ids": input_ids, "attention_mask": [1] * len(input_ids),
+                            "special_tokens_mask": tokenizer.get_special_tokens_mask(
+                                input_ids, already_has_special_tokens=True)}
+            else:
+                left, right = chunk_offsets[0][0], chunk_offsets[-1][1]
+                prepared = tokenizer(doc.text[left:right], add_special_tokens=True,
+                                     return_special_tokens_mask=True)
+                content_ids = [value for value, special in zip(
+                    prepared["input_ids"], prepared["special_tokens_mask"]) if not special]
+                if content_ids != chunk_ids:
+                    raise ValueError("Window retokenization changed token IDs; increase max_length")
             n_special_left = next((i for i, x in enumerate(prepared["special_tokens_mask"]) if not x), len(prepared["input_ids"]))
             prepared["offset_mapping"] = [(0, 0)] * n_special_left + list(chunk_offsets)
             prepared["offset_mapping"] += [(0, 0)] * (len(prepared["input_ids"]) - len(prepared["offset_mapping"]))

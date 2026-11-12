@@ -1,0 +1,167 @@
+"""The data contracts every subpackage shares: corpus, spans, splits, scoring, provenance."""
+
+from __future__ import annotations
+
+from lab.core.assignments import (
+    assert_partition_integrity,
+    assign_partitions,
+    manifest_holdout_index,
+    manifest_partition_names,
+    manifest_ratios,
+    validate_assignments,
+)
+from lab.core.brat import (
+    NO_CODE,
+    is_usable_code,
+    read_ann,
+    read_annotation_tsv,
+    read_annotations,
+    read_codes,
+    resolve_documents,
+)
+from lab.core.corpus import (
+    DOCUMENT_COLUMNS,
+    build_corpus,
+    count_codes,
+    count_labels,
+    document_fingerprints,
+    validate_corpus,
+)
+from lab.core.dataset import (
+    PreparedDataset,
+    derive_dataset_name,
+    prepare_dataset,
+    read_dataset_metadata,
+    split_descriptor,
+)
+from lab.core.io import read_corpus, write_corpus
+from lab.core.labels import (
+    CANONICAL_LABELS,
+    LABEL_ALIASES,
+    normalize_annotation_labels,
+    normalize_entity_labels,
+    normalize_label,
+)
+from lab.core.provenance import file_sha256, read_manifest, write_manifest
+from lab.core.scoring import (
+    SCENARIO_PREFIXES,
+    flatten,
+    group_by_document,
+    normalize_spans,
+    safe_f1,
+    score_characters,
+    score_spans,
+)
+from lab.core.segmentation import (
+    merge_ranges,
+    merge_sentences_crossing_entities,
+    merge_short_sentences,
+    sentence_token_ranges,
+    split_into_words,
+    tokenize_document,
+)
+from lab.core.sentences import (
+    describe_sentence_segmenter,
+    sentence_segmenter,
+    split_into_sentences,
+)
+from lab.core.sources import (
+    CodeMismatchPolicy,
+    CodeResolution,
+    ConflictPolicy,
+    MismatchPolicy,
+    SourceConflict,
+    SourceMismatch,
+    resolve_codes,
+    resolve_conflicts,
+    resolve_mismatch,
+)
+from lab.core.spans import SCORED_SPAN_COLUMNS, SPAN_COLUMNS, span_dataframe, spans_from_corpus
+from lab.core.split import (
+    SplitResult,
+    build_balance_report,
+    create_split,
+    read_split,
+    split_documents,
+    split_paths,
+)
+from lab.core.stats import compute_annotation_stats, compute_text_stats, write_stats
+from lab.core.stratification import parse_document_label_counts
+from lab.core.tasks import resolve_task
+
+__all__ = [
+    "CANONICAL_LABELS",
+    "CodeMismatchPolicy",
+    "CodeResolution",
+    "ConflictPolicy",
+    "DOCUMENT_COLUMNS",
+    "LABEL_ALIASES",
+    "MismatchPolicy",
+    "NO_CODE",
+    "PreparedDataset",
+    "SCENARIO_PREFIXES",
+    "SCORED_SPAN_COLUMNS",
+    "SPAN_COLUMNS",
+    "SourceConflict",
+    "SourceMismatch",
+    "SplitResult",
+    "assert_partition_integrity",
+    "assign_partitions",
+    "build_balance_report",
+    "build_corpus",
+    "compute_annotation_stats",
+    "compute_text_stats",
+    "count_codes",
+    "count_labels",
+    "create_split",
+    "derive_dataset_name",
+    "describe_sentence_segmenter",
+    "document_fingerprints",
+    "file_sha256",
+    "flatten",
+    "group_by_document",
+    "is_usable_code",
+    "manifest_holdout_index",
+    "manifest_partition_names",
+    "manifest_ratios",
+    "merge_ranges",
+    "merge_sentences_crossing_entities",
+    "merge_short_sentences",
+    "normalize_annotation_labels",
+    "normalize_entity_labels",
+    "normalize_label",
+    "normalize_spans",
+    "parse_document_label_counts",
+    "prepare_dataset",
+    "read_ann",
+    "read_annotation_tsv",
+    "read_annotations",
+    "read_codes",
+    "read_corpus",
+    "read_dataset_metadata",
+    "read_manifest",
+    "read_split",
+    "resolve_codes",
+    "resolve_conflicts",
+    "resolve_documents",
+    "resolve_mismatch",
+    "resolve_task",
+    "safe_f1",
+    "score_characters",
+    "score_spans",
+    "sentence_segmenter",
+    "sentence_token_ranges",
+    "span_dataframe",
+    "spans_from_corpus",
+    "split_descriptor",
+    "split_documents",
+    "split_into_sentences",
+    "split_into_words",
+    "split_paths",
+    "tokenize_document",
+    "validate_assignments",
+    "validate_corpus",
+    "write_corpus",
+    "write_manifest",
+    "write_stats",
+]
