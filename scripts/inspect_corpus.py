@@ -27,7 +27,14 @@ def main() -> int:
     parser.add_argument("--languages", nargs="+", help="One fallback language per corpus")
     parser.add_argument("--techniques", nargs="+", help="M0–M8, terms, names, or all")
     parser.add_argument("--terms", nargs="*", default=[])
-    parser.add_argument("--terms-file", help="UTF-8 text file with one initial term per line")
+    parser.add_argument(
+        "--terms-file",
+        "--terms-files",
+        nargs="+",
+        action="extend",
+        default=[],
+        help="TXT lists or Parquets with one terms column",
+    )
     parser.add_argument("--probability", type=float, default=0.15)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--case-sensitive", action="store_true")
@@ -39,7 +46,9 @@ def main() -> int:
         help="Opt in to printing text that may contain clinical PHI",
     )
     parser.add_argument("--examples", type=int, default=3)
-    parser.add_argument("--base-model", help="Local encoder/tokenizer for genuine M8 entropy")
+    parser.add_argument("--base-model", help="Local encoder/tokenizer for entropy or attention")
+    parser.add_argument("--attention-layers", type=int, default=1)
+    parser.add_argument("--attention-max-length", type=int, default=128)
     args = parser.parse_args()
     root = Path(args.output_dir)
     root.mkdir(parents=True, exist_ok=False)
@@ -61,22 +70,23 @@ def main() -> int:
     if not techniques:
         print("Statistics complete. Use --techniques random terms ... to preview masking.")
         return 0
-    terms = list(args.terms)
-    if args.terms_file:
-        terms += [
-            line.strip()
-            for line in Path(args.terms_file).read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+    term_files = list(args.terms_file)
+    terms = []
+    for value in args.terms:
+        if Path(value).suffix.lower() in {".txt", ".parquet"} and Path(value).is_file():
+            term_files.append(value)
+        else:
+            terms.append(value)
     if techniques == ["all"]:
         techniques = [
             name
             for name in TECHNIQUES
-            if (name != "entropy" or args.base_model) and (name != "terms" or terms)
+            if (name not in {"entropy", "attention"} or args.base_model)
+            and (name != "terms" or terms or term_files)
         ]
         if not args.base_model:
-            print("M8 omitted: supply --base-model for real entropy scoring.")
-        if not terms:
+            print("M8/attention omitted: supply --base-model for real model scoring.")
+        if not terms and not term_files:
             print("Term masking omitted: supply --terms or --terms-file.")
     call_cli(
         configuration={
@@ -84,6 +94,9 @@ def main() -> int:
             "output_dir": str(root / "masking"),
             "techniques": techniques,
             "terms": terms,
+            "term_files": term_files,
+            "attention_layers": args.attention_layers,
+            "attention_max_length": args.attention_max_length,
             "probability": args.probability,
             "random_state": args.random_state,
             "case_sensitive": args.case_sensitive,

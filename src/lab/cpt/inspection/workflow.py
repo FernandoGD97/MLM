@@ -10,10 +10,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from lab.core.provenance import file_sha256
+from lab.cpt.inspection.attention import attention_signals
 from lab.cpt.inspection.corpus import read_corpora, segment_corpora
 from lab.cpt.inspection.reporting import corpus_statistics, masked_frames, write_masking
 from lab.cpt.inspection.selection import ALIASES, TECHNIQUES, select_words
 from lab.cpt.inspection.signals import entropy_signals, word_signals
+from lab.cpt.inspection.terms import read_terms
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,7 @@ def inspect_corpora(
     languages: Sequence[str] | None = None,
     techniques: Sequence[str] = (),
     terms: Sequence[str] = (),
+    term_files: Sequence[str] = (),
     probability: float = 0.15,
     random_state: int = 42,
     case_sensitive: bool = False,
@@ -42,6 +46,8 @@ def inspect_corpora(
     examples: int = 3,
     example_characters: int = 300,
     base_model: str | None = None,
+    attention_layers: int = 1,
+    attention_max_length: int = 128,
 ) -> InspectionResult:
     """Read, segment, report, then optionally compare masks under a corpus-wide budget.
 
@@ -60,8 +66,15 @@ def inspect_corpora(
         raise ValueError("probability must be within [0, 1], e.g. 0.2 for 20%.")
     if examples < 0 or example_characters < 1:
         raise ValueError("examples must be nonnegative and example_characters positive.")
-    if "entropy" in chosen and base_model is None:
-        raise ValueError("M8/entropy needs an explicit local base_model; it is never simulated.")
+    if any(name in chosen for name in ("entropy", "attention")) and base_model is None:
+        raise ValueError(
+            "M8/entropy and attention need an explicit local base_model; neither is simulated."
+        )
+    if isinstance(terms, str):
+        raise ValueError("terms must be a list of phrases; use term_files for file paths.")
+    if any(not isinstance(value, str) or not value.strip() for value in terms):
+        raise ValueError("terms must contain nonempty strings.")
+    terms = tuple(dict.fromkeys((*terms, *read_terms(paths=term_files))))
     if "terms" in chosen and not terms:
         raise ValueError("Term masking requires terms or a terms file in the driver script.")
     output = Path(output_dir)
@@ -105,6 +118,35 @@ def inspect_corpora(
     entropy = (
         entropy_signals(documents=documents, base_model=base_model) if "entropy" in chosen else None
     )
+    attention = None
+    if "attention" in chosen:
+        attention = attention_signals(
+            documents=documents,
+            base_model=base_model,
+            layers=attention_layers,
+            max_length=attention_max_length,
+        )
+        rows = [
+            {
+                "corpus": doc.corpus,
+                "row": doc.row,
+                "word_index": index,
+                "start": span[0],
+                "end": span[1],
+                "attention_score": score,
+            }
+            for doc, scores in zip(documents, attention.scores, strict=True)
+            for index, (span, score) in enumerate(zip(doc.words, scores, strict=True))
+        ]
+        pd.DataFrame(rows).to_parquet(output / "attention_scores.parquet", index=False)
+        metadata = {
+            "checkpoint_sha256": attention.checkpoint_sha256,
+            "seconds": attention.seconds,
+            "layers": attention.layers,
+            "max_length": attention.max_length,
+            "aggregation": "incoming_mean_layers_heads_content_queries_relative_mean_subwords",
+        }
+        (output / "attention_metadata.json").write_text(json.dumps(metadata, indent=2))
     if show_examples:
         warnings.warn(
             "Masking examples may contain clinical PHI; display was explicitly enabled.",
@@ -121,6 +163,7 @@ def inspect_corpora(
             backfill=backfill,
             budget_mode=budget_mode,
             entropy=entropy,
+            attention=attention.scores if attention else None,
         )
         masked = masked_frames(frames=frames, documents=documents, selection=selection)
         report = write_masking(
@@ -153,6 +196,10 @@ def inspect_corpora(
         "language": language,
         "languages": languages,
         "base_model": base_model,
+        "term_files": list(term_files),
+        "term_file_sha256": [file_sha256(path) for path in term_files],
+        "attention_layers": attention_layers,
+        "attention_max_length": attention_max_length,
     }
     (output / "masking_config.json").write_text(json.dumps(configuration, indent=2))
 

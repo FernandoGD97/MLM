@@ -123,3 +123,64 @@ Verificación: `python verification/verify_inspection.py` con fixtures locales s
 Se usaron fixtures sintéticos: la imagen recibida describe el formato, pero no contiene
 el archivo `train_full.parquet`. La regresión completa heredada conserva el bloqueo de
 acceso a los tokenizadores externos descrito en `STATUS.md`; estas pruebas nuevas son offline.
+
+## Términos extraídos en TXT o Parquet
+
+Se pueden combinar frases/palabras explícitas y varios archivos de listas:
+
+```bash
+python scripts/inspect_corpus.py train_full.parquet \
+  --language cs --output-dir outputs/terms-and-attention \
+  --terms 'heart failure' \
+  --terms-file initial_terms.txt extracted_key_terms.parquet \
+  --techniques terms attention \
+  --base-model /ruta/al/encoder-local \
+  --attention-layers 1 --attention-max-length 128 \
+  --probability 0.2 --show-examples
+```
+
+`--terms-file` y su alias `--terms-files` aceptan múltiples rutas. También se reconoce
+`--terms extracted_key_terms.parquet` si el archivo existe. TXT admite una entrada por
+línea, con UTF-8/BOM y líneas vacías ignoradas. Parquet requiere **una sola columna llamada
+`terms`**, con una palabra o frase no vacía por fila. Se rechazan nulos, valores numéricos,
+columnas adicionales y listas vacías. Se eliminan duplicados exactos entre las fuentes.
+Un extractor de key terms puede escribir directamente este formato:
+
+```python
+pd.DataFrame({"terms": ["heart failure", "pulmonary edema", "diabetes"]}).to_parquet(
+    "extracted_key_terms.parquet", index=False
+)
+```
+
+En Python/YAML se usa `term_files: [initial_terms.txt, extracted_key_terms.parquet]` junto
+con `terms: [...]`, si procede. La configuración guarda las entradas resueltas y los hashes
+de los archivos. Las frases coinciden como secuencias literales completas de palabras;
+la selección `terms` sigue siendo por palabras independientes dentro de esas coincidencias.
+
+## Atención de Transformers
+
+`attention` es una técnica adicional, distinta de M8/entropía. Ejecuta un encoder local
+real en modo eval y con atención eager. Se promedian las últimas `attention_layers` capas,
+las cabezas y los tokens de consulta de contenido, obteniendo la atención **recibida** por
+cada token de contenido. Padding y tokens especiales no votan ni reciben scores.
+Se normaliza la media de atención recibida por token a uno dentro de cada ventana y se
+promedian los subwords de cada palabra. Una palabra muy fragmentada no obtiene un score
+mayor simplemente por tener más piezas; una atención uniforme produce scores de uno.
+
+Las ventanas conservan límites documentales y offsets. `attention_max_length` limita el
+contexto y el coste cuadrático de las matrices; puede modificar el ranking. El algoritmo
+no descarta silenciosamente el final de documentos largos. El ranking utiliza las mismas
+cuotas proporcionales por corpus y el mismo presupuesto de palabras que las otras técnicas.
+
+Se generan `attention_scores.parquet` (corpus, fila, índice y offsets de palabra, score;
+sin texto clínico) y `attention_metadata.json` (hash del checkpoint, agregación, capas,
+contexto y segundos de carga/puntuación). La selección final se consulta en el Parquet
+enmascarado de la técnica `attention`.
+
+La atención es una **heurística experimental**, no una explicación causal ni evidencia de
+importancia clínica. No garantiza superar masking aleatorio. Modelos que no devuelven
+probabilidades de atención, checkpoints incompletos, atención causal/decoder y tokenizadores
+sin offsets compatibles fallan explícitamente. La ruta fue verificada con BERT diminuto
+local en CPU; no se afirma compatibilidad universal ni rendimiento de modelos biomédicos
+reales. No se descargan modelos automáticamente. `all` incluye atención y entropía solo
+cuando se proporciona `--base-model`.

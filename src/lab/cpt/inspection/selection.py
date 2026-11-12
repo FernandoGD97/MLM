@@ -22,6 +22,7 @@ TECHNIQUES = (
     "ner_keyphrase",
     "triple",
     "entropy",
+    "attention",
 )
 ALIASES = dict(
     zip(
@@ -63,6 +64,7 @@ def select_words(
     backfill: bool = True,
     budget_mode: str = "strict",
     entropy: Sequence[Sequence[float]] | None = None,
+    attention: Sequence[Sequence[float]] | None = None,
 ) -> Selection:
     """Select floor(p * all eligible words), minimizing squared source-quota deviations."""
     if technique not in TECHNIQUES or not math.isfinite(probability) or not 0 <= probability <= 1:
@@ -81,6 +83,10 @@ def select_words(
     for document_index, (doc, evidence) in enumerate(zip(documents, signals, strict=True)):
         if technique == "random":
             scores = (0.0,) * len(doc.words)
+        elif technique == "attention":
+            if attention is None:
+                raise ValueError("attention requires an explicit local encoder checkpoint.")
+            scores = attention[document_index]
         elif technique == "entropy":
             if entropy is None:
                 raise ValueError("entropy requires an explicit local base_model.")
